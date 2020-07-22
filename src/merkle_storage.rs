@@ -193,18 +193,6 @@ impl MerkleStorage {
     ) -> Result<EntryHash, StorageError> {
         let staged_root = self.get_staged_root()?;
         let staged_root_hash = self.hash_tree(&staged_root);
-
-//        let last_commit = match &self.last_commit {
-////            None => vec![], //return Err(StorageError::MissingAncestorCommit),
-//            Some(last_commit) => {
-//                // if nothing changed, just return last commit's hash
-////                if staged_root_hash == last_commit.root_hash {
-////                    return Ok(self.hash_commit(last_commit));
-////                }
-//                last_commit
-//            }
-//        };
-
         let parent_commit_hash= self.last_commit.as_ref()
             .map_or(vec![], |c| self.hash_commit(&c));
         let new_commit = Commit {
@@ -706,26 +694,6 @@ mod tests {
         assert_eq!(storage.get(&key_abc).unwrap(), vec![3u8]);
         assert_eq!(storage.get(&key_abx).unwrap(), vec![4u8]);
     }
-
-    // TODO talk to Brano about this
-//    #[test]
-//    fn test_idempotence() {
-//        let _db_sync = SYNC.lock().unwrap();
-//        clean_db();
-//
-//        let mut storage = get_storage();
-//
-//        let key1: ContextKey = vec!["a".to_string(), "b".to_string()];
-//        storage.set(key1.clone(), vec![2 as u8]).unwrap();
-//        let commit1 = storage.commit(
-//            0, "".to_string(), "".to_string()).unwrap();
-//
-//        storage.set(key1, vec![2 as u8]).unwrap();
-//        let commit2 = storage.commit(
-//            0, "".to_string(), "".to_string()).unwrap();
-//
-//        assert_eq!(commit1, commit2);
-//    }
 
     #[test]
     fn test_persistence_over_reopens() {
