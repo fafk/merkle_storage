@@ -49,9 +49,9 @@ use im_rc::OrdMap as OrdMap;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
-use crypto::digest::Digest;
-use crypto::blake2b::Blake2b;
 use failure::Fail;
+
+use sodiumoxide::crypto::generichash::State;
 
 pub type ContextKey = Vec<String>;
 pub type ContextValue = Vec<u8>;
@@ -95,7 +95,6 @@ pub struct MerkleStorage {
 }
 
 const HASH_LEN: usize = 32;
-static HASH_LEN_BYTES: [u8; 8] = (HASH_LEN as u64).to_be_bytes();
 
 #[derive(Debug, Fail)]
 pub enum StorageError {
@@ -104,9 +103,9 @@ pub enum StorageError {
     DBError { error: rocksdb::Error },
     #[fail(display = "Serialization error: {:?}", error)]
     SerializationError { error: bincode::Error },
-    #[fail(display = "No root found for this commit!")]
 
     /// Internal unrecoverable bugs that should never occur
+    #[fail(display = "No root retrieved for this commit!")]
     CommitRootNotFound,
     #[fail(display = "Cannot commit without a predecessor!")]
     MissingAncestorCommit,
@@ -199,6 +198,7 @@ impl MerkleStorage {
             root_hash: staged_root_hash, parent_commit_hash, time, author, message,
         };
         let entry = Entry::Commit(new_commit.clone());
+
         self.put_to_staging_area(&self.hash_commit(&new_commit), entry.clone());
         self.persist_staged_entry_recursively(&entry)?;
         self.staged = HashMap::new();
@@ -279,11 +279,14 @@ impl MerkleStorage {
             }
         };
 
-        let new_tree_hash = self.hash_tree(&tree);
-        self.put_to_staging_area(&new_tree_hash, Entry::Tree(tree));
-
-        self.compute_new_root_with_change(
-            root, &path, Some(self.get_non_leaf(new_tree_hash)))
+        if tree.is_empty() {
+            self.compute_new_root_with_change(root, &path, None)
+        } else {
+            let new_tree_hash = self.hash_tree(&tree);
+            self.put_to_staging_area(&new_tree_hash, Entry::Tree(tree));
+            self.compute_new_root_with_change(
+                root, &path, Some(self.get_non_leaf(new_tree_hash)))
+        }
     }
 
     /// Find tree by path. Return an empty tree if no tree under this path exists or if a blob
@@ -353,9 +356,9 @@ impl MerkleStorage {
                 }).unwrap_or(Ok(()))
             }
             Entry::Commit(commit) => {
-                match self.staged.get(&commit.root_hash) {
-                    None => Err(StorageError::CommitRootNotFound),
-                    Some(entry) => self.persist_staged_entry_recursively(entry),
+                match self.get_entry(&commit.root_hash) {
+                    Err(err) => Err(err),
+                    Ok(entry) => self.persist_staged_entry_recursively(&entry),
                 }
             }
         }
@@ -370,61 +373,64 @@ impl MerkleStorage {
     }
 
     fn hash_commit(&self, commit: &Commit) -> EntryHash {
-        let mut hasher = Blake2b::new(HASH_LEN);
-        let mut out = vec![0; HASH_LEN];
-        hasher.input(&HASH_LEN_BYTES);
-        hasher.input(&commit.root_hash);
-        if commit.parent_commit_hash == vec![] {
-            hasher.input(&(0 as u64).to_be_bytes());
+        let mut hasher = State::new(HASH_LEN, None).unwrap();
+        let mut out = Vec::with_capacity(HASH_LEN);
+        hasher.update(&(HASH_LEN as u64).to_be_bytes()).expect("hasher");
+        hasher.update(&commit.root_hash).expect("hasher");
+
+        if commit.parent_commit_hash.len() == 0 {
+            hasher.update(&(0 as u64).to_be_bytes()).expect("hasher");
         } else {
-            hasher.input(&(1 as u64).to_be_bytes());
-            hasher.input(&(commit.parent_commit_hash.len() as u64).to_be_bytes());
-            hasher.input(&commit.parent_commit_hash);
+            hasher.update(&(1 as u64).to_be_bytes()).expect("hasher"); // # of parents; we support only 1
+            hasher.update(&(commit.parent_commit_hash.len() as u64).to_be_bytes()).expect("hasher");
+            hasher.update(&commit.parent_commit_hash).expect("hasher");
         }
-        hasher.input(&(commit.time as u64).to_be_bytes());
-        hasher.input(&(commit.author.len() as u64).to_be_bytes());
-        hasher.input(&commit.author.clone().into_bytes());
-        hasher.input(&(commit.message.len() as u64).to_be_bytes());
-        hasher.input(&commit.message.clone().into_bytes());
-        hasher.result(&mut out);
+        hasher.update(&(commit.time as u64).to_be_bytes()).expect("hasher");
+        hasher.update(&(commit.author.len() as u64).to_be_bytes()).expect("hasher");
+        hasher.update(&commit.author.clone().into_bytes()).expect("hasher");
+        hasher.update(&(commit.message.len() as u64).to_be_bytes()).expect("hasher");
+        hasher.update(&commit.message.clone().into_bytes()).expect("hasher");
+
+        out.extend_from_slice(hasher.finalize().unwrap().as_ref());
         out
     }
 
     fn hash_tree(&self, tree: &Tree) -> EntryHash {
-        let mut hasher = Blake2b::new(HASH_LEN);
-        let mut out = vec![0; HASH_LEN];
+        let mut hasher = State::new(HASH_LEN, None).unwrap();
+        let mut out = Vec::with_capacity(HASH_LEN);
 
-//        println!("HASING A TREE...");
-        hasher.input(&(tree.len() as u64).to_be_bytes());
-//        println!("len of tree: {:x?}", (tree.len() as u64).to_be_bytes());
-        // TODO use parallel iterator?
-//        for (k, v) in tree {
+        // println!("HASING A TREE...");
+        hasher.update(&(tree.len() as u64).to_be_bytes()).expect("hasher");
+        //  println!("len of tree: {:x?}", (tree.len() as u64).to_be_bytes());
         tree.iter().for_each(|(k, v)| {
-            hasher.input(&self.encode_irmin_node_kind(&v.node_kind));
-//            println!("child node kind encoded {:x?}", &self.encode_irmin_node_kind(&v.node_kind));
-            hasher.input(&[k.len() as u8]);
-//            println!("key len {:x?}", [k.len() as u8]);
-            hasher.input_str(k);
-//            println!("key bytes {:x?}", k.as_bytes());
-            hasher.input(&HASH_LEN_BYTES);
-//            println!("len of hash: {:x?}", (v.entry_hash.len() as u64).to_be_bytes());
-            hasher.input(&v.entry_hash);
-//            println!("entry hash bytes {:x?}", v.entry_hash);
+            // println!("key {} pointing to {:x?}", k, v.entry_hash.clone().drain(0..4));
+            hasher.update(&self.encode_irmin_node_kind(&v.node_kind)).expect("hasher");
+            // println!("child node kind encoded {:x?}", &self.encode_irmin_node_kind(&v.node_kind));
+            hasher.update(&[k.len() as u8]).expect("hasher");
+            // println!("key len {:x?}", [k.len() as u8]);
+            hasher.update(&k.clone().into_bytes()).expect("hasher");
+            // println!("key bytes {:x?} ({})", k.as_bytes(), k);
+            hasher.update(&(HASH_LEN as u64).to_be_bytes()).expect("hasher");
+            // println!("len of hash: {:x?}", (v.entry_hash.len() as u64).to_be_bytes());
+            hasher.update(&v.entry_hash).expect("hasher");
+            // println!("entry hash bytes {:x?}", v.entry_hash);
         });
-        hasher.result(&mut out);
-//        println!("HASHED TREE {:x?}", out);
+        let hash = hasher.finalize().unwrap();
+        out.extend_from_slice(hash.as_ref());
+        // println!("HASHED TREE {:x?}\n", out);
         out
     }
 
     fn hash_blob(&self, blob: &ContextValue) -> EntryHash {
-        let mut hasher = Blake2b::new(HASH_LEN);
-        let mut out = vec![0; HASH_LEN];
-        hasher.input(&(blob.len() as u64).to_be_bytes());
-//        println!("blob len: {:x?}", (blob.len() as u64).to_be_bytes());
-        hasher.input(blob);
-//        println!("blob: {:x?}", blob);
-        hasher.result(&mut out);
-//        println!("BLOB HASH: {:x?}", out);
+        let mut hasher = State::new(HASH_LEN, None).unwrap();
+        let mut out = Vec::with_capacity(HASH_LEN);
+        hasher.update(&(blob.len() as u64).to_be_bytes()).expect("Failed to update hasher state");
+        // println!("blob len: {:x?}", (blob.len() as u64).to_be_bytes());
+        hasher.update(blob).expect("Failed to update hasher state");
+        // println!("blob: {:x?}", blob);
+        let hash = hasher.finalize().unwrap();
+        out.extend_from_slice(hash.as_ref());
+        // println!("BLOB HASH: {:x?}", out);
         out
     }
 
@@ -556,6 +562,22 @@ mod tests {
 
         assert_eq!([0xCA, 0x7B, 0xC7, 0x02], commit.unwrap()[0..4]);
         // full irmin hash: ca7bc7022ffbd35acc97f7defb00c486bb7f4d19a2d62790d5949775eb74f3c8
+    }
+
+    #[test]
+    fn test_multiple_commit_hash() {
+        let _db_sync = SYNC.lock().unwrap();
+        let mut storage = get_storage();
+        let _commit = storage.commit(
+            0, "Tezos".to_string(), "Genesis".to_string());
+
+        storage.set(vec!["data".to_string(),  "a".to_string(), "x".to_string()], vec![97]);
+        storage.copy(vec!["data".to_string(), "a".to_string()], vec!["data".to_string(), "b".to_string()]);
+        storage.delete(vec!["data".to_string(), "b".to_string(), "x".to_string()]);
+        let commit = storage.commit(
+            0, "Tezos".to_string(), "".to_string());
+
+        assert_eq!([0x9B, 0xB0, 0x0D, 0x6E], commit.unwrap()[0..4]);
     }
 
     #[test]
